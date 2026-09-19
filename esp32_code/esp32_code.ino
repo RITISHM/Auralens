@@ -10,21 +10,21 @@ using namespace websockets;
 // ========== CONFIGURATION ==========
 const char* ssid = "Ritish-laptop";
 const char* password = "07867860";
-const char* ws_server = "ws://10.82.83.72:5000/upload";
+const char* ws_server = "ws://192.168.29.4:5000";
 
 // Recording settings
 const int SAMPLE_RATE = 16000;
-const int TOUCH_THRESHOLD = 40000;
+const int TOUCH_THRESHOLD = 35000;
 const int CHUNK_SIZE = 4096;
 
-// OPTIMIZATION: Increased upload chunk size for faster transfer
-const int UPLOAD_CHUNK_SIZE = 32768;  // 32KB chunks (was 8KB)
+// Upload settings
+const int UPLOAD_CHUNK_SIZE = 32768;
 
-// Connection settings - OPTIMIZED timeouts
-const int MAX_RECONNECT_ATTEMPTS = 2;  // Reduced for faster failure
-const int RECONNECT_DELAY_MS = 1000;   // Reduced delay
-const int WS_TIMEOUT_MS = 120000;       // Reduced to 45s
-const int UPLOAD_TIMEOUT_MS = 60000;   // Reduced to 30s
+// Connection settings
+const int MAX_RECONNECT_ATTEMPTS = 2;
+const int RECONNECT_DELAY_MS = 1000;
+const int WS_TIMEOUT_MS = 120000;
+const int UPLOAD_TIMEOUT_MS = 60000;
 
 // I2S pins
 const int I2S_MIC_SERIAL_CLOCK = 42;
@@ -33,7 +33,7 @@ const int I2S_SPK_SERIAL_DATA = 5;
 const int I2S_SPK_LEFT_RIGHT_CLOCK = 3;
 const int I2S_SPK_SERIAL_CLOCK = 4;
 
-// Camera pins for OV2640 (adjust based on your wiring)
+// Camera pins for OV2640
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
@@ -55,23 +55,23 @@ I2SClass i2s;
 WebsocketsClient wsClient;
 bool uploadComplete = false;
 bool systemReady = false;
-File downloadFile;
 size_t expectedDownloadSize = 0;
 size_t downloadedBytes = 0;
 bool receivingAudio = false;
 unsigned long lastActivityTime = 0;
 
-// OPTIMIZATION: Buffer for faster downloads
-uint8_t* downloadBuffer = nullptr;
-const size_t DOWNLOAD_BUFFER_SIZE = 32768;  // 32KB buffer
+// Streaming variables
+bool isPlayingStream = false;
+bool headerReceived = false;
 
 // ========== FORWARD DECLARATIONS ==========
-void playAudioFile(const char* filename);
 bool ensureWiFiConnected();
 bool connectWebSocket();
 void cleanupWebSocket();
 bool initCamera();
 bool captureAndSaveImage(const char* filename);
+void writeWAVHeader(uint8_t* header, uint32_t dataSize, uint32_t sampleRate);
+bool reinitMicrophone();
 
 // ========== CAMERA INITIALIZATION ==========
 bool initCamera() {
@@ -97,20 +97,18 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   
-  // Image quality settings
   if(psramFound()){
     config.frame_size = FRAMESIZE_UXGA;  
-    config.jpeg_quality =10;  // 0-63, lower means higher quality
+    config.jpeg_quality = 10;
     config.fb_count = 1;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    config.frame_size = FRAMESIZE_VGA;  // 640x480
+    config.frame_size = FRAMESIZE_VGA;
     config.jpeg_quality = 12;
     config.fb_count = 1;
     config.grab_mode = CAMERA_GRAB_LATEST;
   }
   
-  // Initialize camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
@@ -122,7 +120,6 @@ bool initCamera() {
 
 // ========== CAPTURE AND SAVE IMAGE ==========
 bool captureAndSaveImage(const char* filename) {
-  
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("❌ Camera capture failed");
@@ -131,7 +128,6 @@ bool captureAndSaveImage(const char* filename) {
   
   Serial.printf("📸 Captured: %d KB (%dx%d)\n", fb->len/1024, fb->width, fb->height);
   
-  // Save to SD card
   File file = SD.open(filename, FILE_WRITE);
   if (!file) {
     Serial.println("❌ Failed to open image file");
@@ -145,6 +141,42 @@ bool captureAndSaveImage(const char* filename) {
   esp_camera_fb_return(fb);
   
   Serial.printf("💾 Image saved: %s\n", filename);
+  return true;
+}
+
+// ========== MICROPHONE REINITIALIZATION ==========
+bool reinitMicrophone() {
+  Serial.println("🔧 Reinitializing microphone...");
+  
+  i2s.end();
+  delay(200);
+  
+  // Flush camera buffer
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) {
+      esp_camera_fb_return(fb);
+      delay(100);
+    }
+  }
+  
+  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("❌ Mic reinit failed");
+    return false;
+  }
+  
+  // Verify microphone is working
+  delay(100);
+  uint8_t testBuf[128];
+  size_t testBytes = i2s.readBytes((char*)testBuf, 128);
+  
+  if (testBytes == 0) {
+    Serial.println("⚠️ Microphone test read failed");
+    return false;
+  }
+  
+  Serial.println("✅ Microphone ready");
   return true;
 }
 
@@ -171,84 +203,99 @@ void onMessageCallback(WebsocketsMessage message) {
       String sizeStr = msg.substring(sizeStart, sizeEnd);
       expectedDownloadSize = sizeStr.toInt();
       
-      Serial.printf("📥 Receiving response: %d KB\n", expectedDownloadSize/1024);
+      Serial.printf("📥 Streaming response: %d KB\n", expectedDownloadSize/1024);
       
-      // Close any existing file
-      if (downloadFile) {
-        downloadFile.close();
-      }
+      // Initialize speaker for streaming
+      i2s.end();
+      delay(100);
       
-      // Delete old response file if exists
-      if (SD.exists("/response.wav")) {
-        SD.remove("/response.wav");
-      }
-      
-      // OPTIMIZATION: Allocate download buffer
-      if (!downloadBuffer) {
-        downloadBuffer = (uint8_t*)malloc(DOWNLOAD_BUFFER_SIZE);
-      }
-      
-      // Open file for writing
-      downloadFile = SD.open("/response.wav", FILE_WRITE);
-      if (downloadFile) {
-        receivingAudio = true;
-        downloadedBytes = 0;
-      } else {
-        Serial.println("❌ SD write failed");
+      i2s.setPins(I2S_SPK_SERIAL_CLOCK, I2S_SPK_LEFT_RIGHT_CLOCK, I2S_SPK_SERIAL_DATA);
+      if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+        Serial.println("❌ Speaker init failed");
         uploadComplete = true;
+        return;
       }
-    } else if (msg.indexOf("\"sending_audio\":false") >= 0) {
+      
+      receivingAudio = true;
+      downloadedBytes = 0;
+      headerReceived = false;
+      isPlayingStream = true;
+      
+      Serial.println("🔊 Starting live playback...");
+    } 
+    else if (msg.indexOf("\"sending_audio\":false") >= 0) {
       uploadComplete = true;
     }
   } 
   else if (message.isBinary() && receivingAudio) {
     size_t dataSize = message.length();
     
-    if (downloadFile && dataSize > 0) {
-      // OPTIMIZATION: Direct write without buffering
-      size_t written = downloadFile.write((uint8_t*)message.c_str(), dataSize);
-      downloadedBytes += written;
+    if (dataSize > 0) {
+      const uint8_t* data = (uint8_t*)message.c_str();
+      size_t dataOffset = 0;
       
-      // OPTIMIZATION: Batch flush every 64KB for better performance
-      if (downloadedBytes % 65536 == 0) {
-        downloadFile.flush();
+      // Skip WAV header (first 44 bytes)
+      if (!headerReceived && downloadedBytes + dataSize >= 44) {
+        size_t headerBytesInThisChunk = 44 - downloadedBytes;
+        dataOffset = headerBytesInThisChunk;
+        dataSize -= headerBytesInThisChunk;
+        headerReceived = true;
+        Serial.println("✅ Header skipped, streaming audio...");
+      } else if (!headerReceived) {
+        downloadedBytes += dataSize;
+        return;
       }
       
-      // Check if download complete
+      // Stream audio data directly to speaker
+      if (headerReceived && dataSize > 0) {
+        size_t written = i2s.write(data + dataOffset, dataSize);
+        downloadedBytes += (dataOffset + dataSize);
+      } else {
+        downloadedBytes += dataSize;
+      }
+      
+      // Progress indicator
+      if (downloadedBytes % 32768 == 0) {
+        Serial.printf("  🎵 Streaming: %d KB / %d KB\n", 
+                      downloadedBytes/1024, expectedDownloadSize/1024);
+      }
+      
+      // Check if streaming complete
       if (downloadedBytes >= expectedDownloadSize) {
-        downloadFile.flush();
-        downloadFile.close();
         receivingAudio = false;
+        isPlayingStream = false;
         uploadComplete = true;
         
-        Serial.println("✅ Download complete");
+        Serial.println("✅ Streaming data received");
         
-        // Verify file on SD card
-        File verifyFile = SD.open("/response.wav", FILE_READ);
-        if (verifyFile) {
-          size_t actualSize = verifyFile.size();
-          verifyFile.close();
-          
-          if (actualSize >= expectedDownloadSize) {
-            
-            Serial.println("▶️  Playing response...\n");
-            delay(300);
-            
-          }
+        // CRITICAL FIX: Calculate how long to wait for audio to finish playing
+        // At 16kHz, 16-bit mono: 32000 bytes/second
+        float audioDurationMs = (downloadedBytes / 32.0);  // milliseconds of audio
+        
+        Serial.printf("⏳ Waiting for playback to finish (%.1fs)...\n", audioDurationMs/1000.0);
+        
+        // Wait for audio to actually play out
+        delay(audioDurationMs + 500);  // Add 500ms safety margin
+        
+        Serial.println("🔇 Playback finished");
+        
+        // Now safe to reinitialize microphone
+        if (reinitMicrophone()) {
+          systemReady = true;
+        } else {
+          Serial.println("❌ Failed to reinit microphone after playback");
+          systemReady = false;
         }
       }
-      Serial.print("size received=");
-            Serial.println(downloadedBytes/1024);
     }
   }
 }
 
 void onEventsCallback(WebsocketsEvent event, String data) {
   if (event == WebsocketsEvent::ConnectionClosed) {
-    if (receivingAudio && downloadFile) {
-      downloadFile.flush();
-      downloadFile.close();
+    if (receivingAudio && isPlayingStream) {
       receivingAudio = false;
+      isPlayingStream = false;
     }
     uploadComplete = true;
   }
@@ -312,185 +359,12 @@ bool connectWebSocket() {
 }
 
 void cleanupWebSocket() {
-  // if (wsClient.available()) {
-  //   wsClient.close();
-  // }
-  
-  if (receivingAudio && downloadFile) {
-    downloadFile.flush();
-    downloadFile.close();
+  if (receivingAudio && isPlayingStream) {
+    delay(500);
     receivingAudio = false;
+    isPlayingStream = false;
   }
-}
-
-// ========== SETUP ==========
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-  
-  Serial.println("\n🎤📸 Audio & Image Recorder (OPTIMIZED)");
-  Serial.println("========================================\n");
-
-  // === Touch sensor ===
-  // touchAttachInterrupt(T1, [](){}, TOUCH_THRESHOLD);
-
-  // === SD Card ===
-  Serial.print("💾 SD Card...");
-  if (!SD.begin(21)) {
-    Serial.println(" ❌");
-    while(1) delay(1000);
-  }
-  Serial.println(" ✅");
-  
-  if (SD.exists("/response.wav")) {
-    SD.remove("/response.wav");
-  }
-
-  // === Camera ===
-  Serial.print("📸 Camera...");
-  if (!initCamera()) {
-    Serial.println(" ❌");
-    while(1) delay(1000);
-  }
-  
-
-  // === Microphone ===
-  Serial.print("🎙️ Microphone...");
-  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
-  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
-    Serial.println(" ❌");
-    while(1) delay(1000);
-  }
-  Serial.println(" ✅");
-
-  // === WiFi ===
-  Serial.print("📡 WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(" ❌");
-    while(1) delay(1000);
-  }
-  
-  Serial.println(" ✅");
-  Serial.printf("   %s (%d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  
-  systemReady = true;
-  Serial.println("\n✅ Ready! Touch T2 to capture image & record\n");
-}
-
-// ========== LOOP ==========
-void loop() {
-  if (!systemReady) {
-    delay(1000);
-    return;
-  }
-  for (int i = 0; i < 3; i++) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (fb) {
-      esp_camera_fb_return(fb);
-      delay(100);  // Small delay between flushes
-    }
-  }
-  // OPTIMIZATION: Less frequent WiFi checks
-  static unsigned long lastWiFiCheck = 0;
-  if (millis() - lastWiFiCheck > 10000) {
-    if (WiFi.status() != WL_CONNECTED) {
-      ensureWiFiConnected();
-    }
-    lastWiFiCheck = millis();
-  }
-  
-  int touchValue = touchRead(T2);
-  
-  if (touchValue > TOUCH_THRESHOLD) {
-    unsigned long sessionStart = millis();
-    
-    // ===== STEP 1: CAPTURE IMAGE =====
-    Serial.println("📸 Capturing image...");
-    
-    char imageFilename[32];
-    sprintf(imageFilename, "/image_%lu.jpg", millis());
-    
-    if (!captureAndSaveImage(imageFilename)) {
-      Serial.println("⚠️ Image capture failed, continuing with audio only\n");
-    }
-    
-    delay(200);  // Small delay between capture and recording
-    
-    // ===== STEP 2: RECORD AUDIO =====
-    Serial.println("🎙️ Recording audio...");
-    
-    unsigned long recordStart = millis();
-    
-    if (SD.exists("/recording.wav")) {
-      SD.remove("/recording.wav");
-    }
-    
-    File file = SD.open("/recording.wav", FILE_WRITE);
-    
-    if (!file) {
-      Serial.println("❌ File open failed");
-      delay(1000);
-      return;
-    }
-
-    uint8_t wavHeader[44];
-    writeWAVHeader(wavHeader, 0, SAMPLE_RATE);
-    file.write(wavHeader, 44);
-    
-    size_t totalBytes = 0;
-    uint8_t buffer[CHUNK_SIZE];
-    
-    while (touchRead(T2) > TOUCH_THRESHOLD) {
-      size_t bytesRead = i2s.readBytes((char*)buffer, CHUNK_SIZE);
-      if (bytesRead > 0) {
-        file.write(buffer, bytesRead);
-        totalBytes += bytesRead;
-        
-        // OPTIMIZATION: Batch flush every 32KB
-        if (totalBytes % 32768 == 0) {
-          file.flush();
-        }
-      }
-      yield();
-    }
-    
-    float recordDuration = (millis() - recordStart) / 1000.0;
-    
-    file.seek(0);
-    writeWAVHeader(wavHeader, totalBytes, SAMPLE_RATE);
-    file.write(wavHeader, 44);
-    file.flush();
-    file.close();
-    
-    Serial.printf("✅ Recorded: %.1fs, %d KB\n", recordDuration, totalBytes/1024);
-    
-    // ===== STEP 3: UPLOAD BOTH FILES =====
-    if (totalBytes > 1000) {
-      uploadImageAndAudio(imageFilename, "/recording.wav", totalBytes + 44);
-    } else {
-      Serial.println("⚠️ Audio too short\n");
-    }
-    
-    float sessionDuration = (millis() - sessionStart) / 1000.0;
-    Serial.printf("✅ Session complete (%.1fs)\n", sessionDuration);
-    Serial.println("Ready\n");
-    delay(500);
-  }
-  
-  delay(50);
+  wsClient.close();
 }
 
 // ========== HELPER FUNCTIONS ==========
@@ -516,99 +390,6 @@ void writeWAVHeader(uint8_t* header, uint32_t dataSize, uint32_t sampleRate) {
   memcpy(header + 34, &bitsPerSample, 2);
   memcpy(header + 36, "data", 4);
   memcpy(header + 40, &dataSize, 4);
-}
-
-// ========== UPLOAD IMAGE AND AUDIO ==========
-void uploadImageAndAudio(const char* imageFile, const char* audioFile, size_t audioSize) {
-  Serial.println("\n📤 Uploading image and audio...");
-  
-  uploadComplete = false;
-  receivingAudio = false;
-  downloadedBytes = 0;
-  
-  if (!connectWebSocket()) {
-    Serial.println("❌ Connection failed");
-    return;
-  }
-  
-  delay(200);
-  
-  // Get image size
-  size_t imageSize = 0;
-  bool hasImage = SD.exists(imageFile);
-  
-  if (hasImage) {
-    File imgFile = SD.open(imageFile, FILE_READ);
-    if (imgFile) {
-      imageSize = imgFile.size();
-      imgFile.close();
-    }
-  }
-  
-  // Send metadata: image_size,audio_size
-  String metadata = String(imageSize) + "," + String(audioSize);
-  if (!wsClient.send(metadata)) {
-    Serial.println("❌ Metadata send failed");
-    cleanupWebSocket();
-    return;
-  }
-  
-  Serial.printf("✅ Metadata sent: Image=%d KB, Audio=%d KB\n", imageSize/1024, audioSize/1024);
-  delay(100);
-  
-  // Upload image first (if exists)
-  if (hasImage && imageSize > 0) {
-    Serial.println("📤 Uploading image...");
-    if (!uploadFile(imageFile, imageSize)) {
-      Serial.println("⚠️ Image upload failed, continuing with audio");
-    }
-  }
-  
-  // Upload audio
-  Serial.println("📤 Uploading audio...");
-  if (!uploadFile(audioFile, audioSize)) {
-    Serial.println("❌ Audio upload failed");
-    cleanupWebSocket();
-    return;
-  }
-  
-  // Send EOF marker
-  delay(100);
-  wsClient.send("EOF");
-  Serial.println("✅ EOF sent");
-  
-  // Wait for server response
-  Serial.print("⏳ Waiting for response");
-  unsigned long waitStart = millis();
-  lastActivityTime = millis();
-  
-  int dots = 0;
-  while (!uploadComplete && (millis() - waitStart < WS_TIMEOUT_MS)) {
-    wsClient.poll();
-    
-    if ((millis() - waitStart) % 1000 < 50 && dots < 30) {
-      Serial.print(".");
-      dots++;
-    }
-    
-    if (millis() - lastActivityTime > 60000) {
-      Serial.println("\n⚠️ Server not responding");
-      break;
-    }
-    
-    delay(50);
-  }
-  
-  Serial.println();
-  
-  if (uploadComplete) {
-    Serial.println("✅ Transaction complete\n");
-    playAudioFile("/response.wav");
-  } else {
-    Serial.println("⚠️ No response received\n");
-  }
-  
-  cleanupWebSocket();
 }
 
 // ========== UPLOAD SINGLE FILE ==========
@@ -676,71 +457,330 @@ bool uploadFile(const char* filename, size_t fileSize) {
   }
 }
 
-// ========== AUDIO PLAYBACK ==========
-void playAudioFile(const char* filename) {
-  Serial.println("🔊 Playing...");
+// ========== UPLOAD IMAGE AND AUDIO ==========
+void uploadImageAndAudio(const char* imageFile, const char* audioFile, size_t audioSize) {
+  Serial.println("\n📤 Uploading image and audio...");
   
-  File audioFile = SD.open(filename, FILE_READ);
-  if (!audioFile) {
-    Serial.println("❌ File not found");
+  uploadComplete = false;
+  receivingAudio = false;
+  downloadedBytes = 0;
+  
+  if (!connectWebSocket()) {
+    Serial.println("❌ Connection failed");
     return;
   }
   
-  size_t fileSize = audioFile.size();
+  delay(200);
   
-  if (fileSize < 44) {
-    Serial.println("❌ Invalid file");
-    audioFile.close();
-    return;
-  }
+  // Get image size
+  size_t imageSize = 0;
+  bool hasImage = SD.exists(imageFile);
   
-  audioFile.seek(44);
-  
-  i2s.end();
-  delay(100);
-  
-  i2s.setPins(I2S_SPK_SERIAL_CLOCK, I2S_SPK_LEFT_RIGHT_CLOCK, I2S_SPK_SERIAL_DATA);
-  if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
-    Serial.println("❌ Speaker init failed");
-    audioFile.close();
-    return;
-  }
-  
-  const size_t PLAY_CHUNK_SIZE = 8192;
-  uint8_t* buffer = (uint8_t*)malloc(PLAY_CHUNK_SIZE);
-  
-  if (!buffer) {
-    Serial.println("❌ Memory failed");
-    audioFile.close();
-    i2s.end();
-    return;
-  }
-  
-  size_t bytesRead;
-  
-  while ((bytesRead = audioFile.read(buffer, PLAY_CHUNK_SIZE)) > 0) {
-    i2s.write(buffer, bytesRead);
-  }
-  
-  Serial.println("✅ Playback done");
-  for (int i = 0; i < 3; i++) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (fb) {
-      esp_camera_fb_return(fb);
-      delay(100);  // Small delay between flushes
+  if (hasImage) {
+    File imgFile = SD.open(imageFile, FILE_READ);
+    if (imgFile) {
+      imageSize = imgFile.size();
+      imgFile.close();
     }
   }
-  Serial.println(" ✅");
-  free(buffer);
-  audioFile.close();
-  i2s.end();
   
+  // Send metadata: image_size,audio_size
+  String metadata = String(imageSize) + "," + String(audioSize);
+  if (!wsClient.send(metadata)) {
+    Serial.println("❌ Metadata send failed");
+    cleanupWebSocket();
+    return;
+  }
+  
+  Serial.printf("✅ Metadata sent: Image=%d KB, Audio=%d KB\n", imageSize/1024, audioSize/1024);
   delay(100);
-  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
-  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
-    Serial.println("❌ Mic reinit failed");
-    systemReady = false;
+  
+  // Upload image first (if exists)
+  if (hasImage && imageSize > 0) {
+    Serial.println("📤 Uploading image...");
+    if (!uploadFile(imageFile, imageSize)) {
+      Serial.println("⚠️ Image upload failed, continuing with audio");
+    }
+  }
+  
+  // Upload audio
+  Serial.println("📤 Uploading audio...");
+  if (!uploadFile(audioFile, audioSize)) {
+    Serial.println("❌ Audio upload failed");
+    cleanupWebSocket();
+    return;
+  }
+  
+  // Send EOF marker
+  delay(100);
+  wsClient.send("EOF");
+  Serial.println("✅ EOF sent");
+  
+  // Wait for server response (streaming will happen in callback)
+  Serial.print("⏳ Waiting for response");
+  unsigned long waitStart = millis();
+  lastActivityTime = millis();
+  
+  int dots = 0;
+  while (!uploadComplete && (millis() - waitStart < WS_TIMEOUT_MS)) {
+    wsClient.poll();
+    
+    if ((millis() - waitStart) % 1000 < 50 && dots < 30 && !isPlayingStream) {
+      Serial.print(".");
+      dots++;
+    }
+    
+    if (millis() - lastActivityTime > 60000) {
+      Serial.println("\n⚠️ Server not responding");
+      break;
+    }
+    
+    delay(50);
   }
   
   Serial.println();
+  
+  if (uploadComplete) {
+    Serial.println("✅ Transaction complete\n");
+  } else {
+    Serial.println("⚠️ No response received\n");
+  }
+  
+  cleanupWebSocket();
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n🎤📸 Audio & Image Recorder (STREAMING)");
+  Serial.println("========================================\n");
+
+  // === SD Card ===
+  Serial.print("💾 SD Card...");
+  if (!SD.begin(21)) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
+  }
+  Serial.println(" ✅");
+
+  // === Camera ===
+  Serial.print("📸 Camera...");
+  if (!initCamera()) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
+  }
+  Serial.println(" ✅");
+
+  // === Microphone ===
+  Serial.print("🎙️ Microphone...");
+  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
+  }
+  Serial.println(" ✅");
+  
+  Serial.println("\n🔧 I2S Configuration:");
+  Serial.printf("   Sample Rate: %d Hz\n", SAMPLE_RATE);
+  Serial.printf("   Bit Width: 16-bit\n");
+  Serial.printf("   Mode: Mono\n");
+
+  // === WiFi ===
+  Serial.print("\n📡 WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
+  }
+  
+  Serial.println(" ✅");
+  Serial.printf("   %s (%d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  
+  systemReady = true;
+  Serial.println("\n✅ Ready! Touch T2 to capture image & record\n");
+}
+
+// ========== LOOP ==========
+void loop() {
+  wsClient.poll();
+  
+  if (!systemReady) {
+    delay(1000);
+    return;
+  }
+  
+  // WiFi check every 10 seconds
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 10000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      ensureWiFiConnected();
+    }
+    lastWiFiCheck = millis();
+  }
+  
+  // Periodic microphone health check (every 30 seconds when idle)
+  static unsigned long lastMicCheck = 0;
+  if (millis() - lastMicCheck > 30000) {
+    uint8_t testBuf[128];
+    size_t testBytes = i2s.readBytes((char*)testBuf, 128);
+    
+    if (testBytes == 0) {
+      Serial.println("⚠️ Microphone appears stuck, resetting...");
+      if (reinitMicrophone()) {
+        systemReady = true;
+      } else {
+        systemReady = false;
+      }
+    }
+    
+    lastMicCheck = millis();
+  }
+  
+  int touchValue = touchRead(T2);
+  
+  if (touchValue > TOUCH_THRESHOLD) {
+    unsigned long sessionStart = millis();
+    
+    // Flush camera buffer
+    for (int i = 0; i < 3; i++) {
+      camera_fb_t * fb = esp_camera_fb_get();
+      if (fb) {
+        esp_camera_fb_return(fb);
+        delay(100);
+      }
+    }
+    
+    // ===== STEP 1: CAPTURE IMAGE =====
+    Serial.println("📸 Capturing image...");
+    
+    char imageFilename[32];
+    sprintf(imageFilename, "/image_%lu.jpg", millis());
+    
+    if (!captureAndSaveImage(imageFilename)) {
+      Serial.println("⚠️ Image capture failed, continuing with audio only\n");
+    }
+    
+    delay(200);
+    
+    // ===== STEP 2: RECORD AUDIO =====
+    Serial.println("🎙️ Recording audio...");
+    
+    unsigned long recordStart = millis();
+    
+    if (SD.exists("/recording.wav")) {
+      SD.remove("/recording.wav");
+    }
+    
+    File file = SD.open("/recording.wav", FILE_WRITE);
+    
+    if (!file) {
+      Serial.println("❌ File open failed");
+      delay(1000);
+      return;
+    }
+
+    uint8_t wavHeader[44];
+    writeWAVHeader(wavHeader, 0, SAMPLE_RATE);
+    file.write(wavHeader, 44);
+    
+    size_t totalBytes = 0;
+    uint8_t buffer[CHUNK_SIZE];
+    
+    // CRITICAL FIX: Verify microphone is actually working
+    Serial.println("🔍 Testing microphone...");
+    size_t testRead = i2s.readBytes((char*)buffer, CHUNK_SIZE);
+    if (testRead == 0) {
+      Serial.println("❌ Microphone not responding!");
+      file.close();
+      SD.remove("/recording.wav");
+      
+      // Force microphone reinit
+      if (reinitMicrophone()) {
+        Serial.println("✅ Microphone reinitialized");
+        systemReady = true;
+      } else {
+        Serial.println("❌ Microphone reinit failed");
+        systemReady = false;
+      }
+      delay(1000);
+      return;
+    }
+    file.write(buffer, testRead);
+    totalBytes += testRead;
+    Serial.println("✅ Microphone working");
+    
+    // Now record normally
+    while (touchRead(T2) > TOUCH_THRESHOLD) {
+      size_t bytesRead = i2s.readBytes((char*)buffer, CHUNK_SIZE);
+      
+      if (bytesRead > 0) {
+        file.write(buffer, bytesRead);
+        totalBytes += bytesRead;
+        
+        // Debug output every second
+        if (totalBytes % 32000 == 0) {
+          Serial.printf("  📊 Recording: %d KB (%.1fs)\n", 
+                        totalBytes/1024, 
+                        (millis() - recordStart)/1000.0);
+          file.flush();
+        }
+      } else {
+        // If no bytes read, microphone might be stuck
+        Serial.println("⚠️ No audio data from microphone!");
+        delay(10);
+      }
+      
+      yield();
+    }
+    
+    float recordDuration = (millis() - recordStart) / 1000.0;
+    
+    file.seek(0);
+    writeWAVHeader(wavHeader, totalBytes, SAMPLE_RATE);
+    file.write(wavHeader, 44);
+    file.flush();
+    file.close();
+    
+    Serial.printf("✅ Recorded: %.1fs, %d KB\n", recordDuration, totalBytes/1024);
+    
+    // Verify we actually recorded something
+    if (totalBytes < 1000) {
+      Serial.println("❌ Recording failed - no audio data captured");
+      Serial.println("🔧 Attempting microphone reset...");
+      
+      if (reinitMicrophone()) {
+        Serial.println("✅ Microphone reset complete");
+        systemReady = true;
+      } else {
+        Serial.println("❌ Microphone reset failed");
+        systemReady = false;
+      }
+      delay(1000);
+      return;
+    }
+    
+    // ===== STEP 3: UPLOAD BOTH FILES =====
+    uploadImageAndAudio(imageFilename, "/recording.wav", totalBytes + 44);
+    
+    float sessionDuration = (millis() - sessionStart) / 1000.0;
+    Serial.printf("✅ Session complete (%.1fs)\n", sessionDuration);
+    Serial.println("Ready\n");
+    delay(500);
+  }
+  
+  delay(50);
 }

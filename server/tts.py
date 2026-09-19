@@ -1,16 +1,21 @@
-from gtts import gTTS
-from pydub import AudioSegment
+from kokoro import KPipeline
+import soundfile as sf
+import numpy as np
+import librosa
 
-text = "Hello Ritish, this is a test using gTTS!"
-
-print ("TTS setup is done ✅")
-
-def text_to_speech(text,response_audio_path):
-  tts = gTTS(text=text, lang='hi',slow=False)
-  tts.save("output.mp3")
-  sound = AudioSegment.from_mp3("output.mp3")
-  sound = sound.set_frame_rate(16000).set_sample_width(2)
-  sound.export(response_audio_path, format="wav")
-
-  return 
+pipeline = KPipeline(lang_code='h', device='cuda')
+print("TTS done")
+def text_to_speech(text, response_audio_path):
    
+   generator = pipeline(text, voice='af_heart')
+
+   all_audio = []
+   for i, (gs, ps, audio) in enumerate(generator):
+      all_audio.append(audio)
+
+   final_audio = np.concatenate(all_audio)
+
+  # RESAMPLE to 16k cleanly
+   resampled_audio = librosa.resample(final_audio, orig_sr=24000, target_sr=16000)
+
+   sf.write(response_audio_path, resampled_audio, 16000)

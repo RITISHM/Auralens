@@ -31,10 +31,11 @@ upload_lock = Lock()
 message_queue = deque(maxlen=100)
 broadcast_clients = set()
 
-# OPTIMIZATION: Increased chunk sizes for faster transfer
+# STREAMING: Smaller chunk size for lower latency
 RECEIVE_CHUNK_SIZE = 32768  # 32KB chunks
-SEND_CHUNK_SIZE = 1024*33     # 32KB chunks
-chat_started=False
+STREAM_CHUNK_SIZE = 4096     # 4KB chunks for streaming
+chat_started = False
+
 def send_error_response(ws, message):
     """Send error response to client"""
     try:
@@ -269,7 +270,7 @@ def upload(ws):
             # ===== SAVE FILES =====
             timestamp = int(time.time())
             
-            # Save image - FIXED: Use just filename, not full path
+            # Save image
             if image_data and len(image_data) > 0:
                 image_filename = f"image_{timestamp}.jpg"
                 image_filepath = os.path.join(IMAGE_FOLDER, image_filename)
@@ -289,7 +290,7 @@ def upload(ws):
                     print(f"❌ Image save error: {e}")
                     image_filename = None
             
-            # Save audio - FIXED: Use just filename, not full path
+            # Save audio
             audio_filename = f"audio_{timestamp}.wav"
             audio_filepath = os.path.join(AUDIO_FOLDER, audio_filename)
             try:
@@ -310,7 +311,7 @@ def upload(ws):
                 send_error_response(ws, f"Audio save error: {str(e)}")
                 return
             
-            # FIXED: Response audio filename
+            # Response audio filename
             response_filename = f"response_{timestamp}.wav"
             RESPONSE_AUDIO = os.path.join(RESPONSE_FOLDER, response_filename)
             
@@ -327,7 +328,7 @@ def upload(ws):
                 transcribe = speech_to_text(audio_filepath)
                 print(f"📝 Transcription: {transcribe[:100]}...")
                 
-                # BROADCAST TRANSCRIPTION TO WEB CLIENTS - FIXED: Use correct URL format
+                # BROADCAST TRANSCRIPTION TO WEB CLIENTS
                 image_url = f"/images/{image_filename}" if image_filename else None
                 print(f"🖼️ Broadcasting image URL: {image_url}")
                 if image_filename:
@@ -367,10 +368,11 @@ def upload(ws):
                 
                 processing_time = time.time() - processing_start
                 print(f"✅ Processing complete ({processing_time:.1f}s)")
+                print(f"   Total time so far: {time.time() - t_audio_start:.1f}s")
                 
-                # BROADCAST RESPONSE TO WEB CLIENTS - FIXED: Use correct URL format
+                # BROADCAST RESPONSE TO WEB CLIENTS
                 audio_url = f"/audio/{response_filename}"
-                print(f"🔊 Broadcasting audio URL: {audio_url}")
+                print(f"📊 Broadcasting audio URL: {audio_url}")
                 print(f"   File exists: {os.path.exists(RESPONSE_AUDIO)}")
                 print(f"   Absolute path: {os.path.abspath(RESPONSE_AUDIO)}")
                 broadcast_to_clients({
@@ -386,7 +388,7 @@ def upload(ws):
                 send_error_response(ws, f"Processing error: {str(e)}")
                 return
             
-            # ===== SEND RESPONSE AUDIO =====
+            # ===== STREAM RESPONSE AUDIO =====
             if not os.path.exists(RESPONSE_AUDIO):
                 print(f"⚠️ No response audio generated")
                 
@@ -401,7 +403,7 @@ def upload(ws):
                 return
             
             audio_size = os.path.getsize(RESPONSE_AUDIO)
-            print(f"📤 Sending response: {audio_size/1024:.1f} KB")
+            print(f"📤 Streaming response: {audio_size/1024:.1f} KB")
             
             # Send metadata
             response = {
@@ -409,18 +411,19 @@ def upload(ws):
                 "upload_size": len(audio_data),
                 "image_received": image_filename is not None,
                 "audio_size": audio_size,
-                "sending_audio": True
+                "sending_audio": True,
+                "streaming": True  # Indicate streaming mode
             }
             
             try:
                 ws.send(json.dumps(response))
-                time.sleep(0.1)
+                time.sleep(0.05)  # Reduced delay for faster start
                 
             except Exception as e:
                 print(f"❌ Metadata send failed: {e}")
                 return
             
-            # Send audio in chunks
+            # Stream audio in smaller chunks for lower latency
             send_start = time.time()
             sent_bytes = 0
             send_chunk_count = 0
@@ -428,7 +431,7 @@ def upload(ws):
             try:
                 with open(RESPONSE_AUDIO, "rb") as f:
                     while True:
-                        chunk = f.read(SEND_CHUNK_SIZE)
+                        chunk = f.read(STREAM_CHUNK_SIZE)
                         if not chunk:
                             break
                         
@@ -436,20 +439,25 @@ def upload(ws):
                         sent_bytes += len(chunk)
                         send_chunk_count += 1
                         
-                        time.sleep(0.01)
+                        # Minimal delay for smooth streaming
+                        time.sleep(0.005)  # 5ms delay between chunks
+                        
+                        # Progress indicator every 20KB
+                        if sent_bytes % 20480 == 0:
+                            print(f"  📡 Streaming: {sent_bytes/1024:.1f} KB / {audio_size/1024:.1f} KB")
                 
                 send_time = time.time() - send_start
-                print(f"✅ Response sent: {sent_bytes/1024:.1f} KB in {send_time:.1f}s ({sent_bytes/send_time/1024:.1f} KB/s)")
-                time.sleep(0.7)
+                print(f"✅ Response streamed: {sent_bytes/1024:.1f} KB in {send_time:.1f}s ({sent_bytes/send_time/1024:.1f} KB/s)")
+                time.sleep(0.5)
                 
             except Exception as e:
-                print(f"❌ Send error: {e}")
+                print(f"❌ Stream error: {e}")
                 return
             
             # ===== SUMMARY =====
             total_time = time.time() - t_audio_start
             print(f"✅ Transaction complete ({total_time:.1f}s total)")
-            print(f"   Image: {image_time:.1f}s, Audio: {audio_time:.1f}s, Process: {processing_time:.1f}s, Send: {send_time:.1f}s")
+            print(f"   Image: {image_time:.1f}s, Audio: {audio_time:.1f}s, Process: {processing_time:.1f}s, Stream: {send_time:.1f}s")
             print()
             
         except Exception as e:
@@ -482,7 +490,6 @@ def serve_image(filename):
         return send_from_directory(os.path.abspath(IMAGE_FOLDER), filename, mimetype='image/jpeg')
     else:
         print(f"   ❌ Image not found")
-        # List files in directory for debugging
         if os.path.exists(IMAGE_FOLDER):
             files = os.listdir(IMAGE_FOLDER)
             print(f"   Available files: {files[:5]}")
@@ -506,7 +513,6 @@ def serve_audio(filename):
         return send_from_directory(os.path.abspath(AUDIO_FOLDER), filename, mimetype='audio/wav')
     else:
         print(f"   ❌ Audio not found in either location")
-        # List files in directory for debugging
         if os.path.exists(RESPONSE_FOLDER):
             files = os.listdir(RESPONSE_FOLDER)
             print(f"   Available response files: {files[:5]}")
@@ -540,7 +546,7 @@ def index():
     return f'''<!DOCTYPE html>
 <html>
 <head>
-    <title>Audio & Image WebSocket Server</title>
+    <title>Audio & Image WebSocket Server (STREAMING)</title>
     <style>
         body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
         .container {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
@@ -548,6 +554,7 @@ def index():
         .status {{ padding: 10px; border-radius: 5px; margin: 10px 0; }}
         .ok {{ background: #d4edda; color: #155724; }}
         .info {{ background: #d1ecf1; color: #0c5460; }}
+        .streaming {{ background: #fff3cd; color: #856404; }}
         table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
         td {{ padding: 10px; border-bottom: 1px solid #ddd; }}
         td:first-child {{ font-weight: bold; width: 200px; }}
@@ -558,14 +565,15 @@ def index():
 </head>
 <body>
     <div class="container">
-        <h1>🎤📸 Audio & Image WebSocket Server</h1>
+        <h1>🎤📸 Audio & Image WebSocket Server (STREAMING)</h1>
         <div class="status ok"><strong>Status:</strong> Running ✅</div>
+        <div class="status streaming"><strong>🚀 STREAMING MODE ENABLED</strong> - Audio plays in real-time!</div>
         <div style="margin: 20px 0;"><a href="/chat" class="btn">🚀 Open Chat Interface</a></div>
         <table>
             <tr><td>WebSocket Endpoint</td><td><code>ws://0.0.0.0:5000/upload</code></td></tr>
             <tr><td>Chat Interface</td><td><a href="/chat" style="color: #667eea;">http://0.0.0.0:5000/chat</a></td></tr>
-            <tr><td>Protocol</td><td>Image + Audio → Process → Response</td></tr>
-            <tr><td>Chunk Size</td><td>{SEND_CHUNK_SIZE/1024:.0f} KB (Optimized)</td></tr>
+            <tr><td>Protocol</td><td>Image + Audio → Process → <strong>STREAM</strong> Response</td></tr>
+            <tr><td>Stream Chunk Size</td><td>{STREAM_CHUNK_SIZE/1024:.0f} KB (Low Latency)</td></tr>
             <tr><td>Audio Files</td><td>{upload_count} recordings</td></tr>
             <tr><td>Image Files</td><td>{image_count} images</td></tr>
             <tr><td>Response Files</td><td>{response_count} responses</td></tr>
@@ -578,9 +586,10 @@ def index():
             • Captures image from OV2640 camera<br>
             • Records audio after image capture<br>
             • Uses image context for AI response generation<br>
-            • Returns audio response to device<br>
+            • <strong>STREAMS audio response directly to device (no SD card storage!)</strong><br>
             • Real-time chat interface for monitoring<br>
-            • 32KB chunk sizes for optimal transfer speed
+            • 4KB chunk sizes for ultra-low latency streaming<br>
+            • Audio starts playing within ~1 second
         </div>
     </div>
 </body>
@@ -596,15 +605,16 @@ def health():
         "image_folder": IMAGE_FOLDER,
         "response_folder": RESPONSE_FOLDER,
         "broadcast_clients": len(broadcast_clients),
+        "streaming_enabled": True,
         "optimizations": {
             "receive_chunk_size": RECEIVE_CHUNK_SIZE,
-            "send_chunk_size": SEND_CHUNK_SIZE
+            "stream_chunk_size": STREAM_CHUNK_SIZE
         }
     }
 
 if __name__ == '__main__':
     print("\n" + "=" * 60)
-    print("🚀 Audio & Image WebSocket Server (OPTIMIZED)")
+    print("🚀 Audio & Image WebSocket Server (STREAMING MODE)")
     print("=" * 60)
     print(f"📁 Audio folder: {os.path.abspath(AUDIO_FOLDER)}")
     print(f"🖼️  Image folder: {os.path.abspath(IMAGE_FOLDER)}")
@@ -612,9 +622,10 @@ if __name__ == '__main__':
     print(f"🌐 WebSocket: ws://0.0.0.0:5000/upload")
     print(f"🌐 Web interface: http://0.0.0.0:5000")
     print(f"💬 Chat interface: http://0.0.0.0:5000/chat")
-    print(f"🏥 Health check: http://0.0.0.0:5000/health")
-    print(f"📋 Protocol: IMAGE + AUDIO → PROCESS → RESPONSE")
-    print(f"⚡ Chunk size: {SEND_CHUNK_SIZE/1024:.0f} KB")
+    print(f"🩺 Health check: http://0.0.0.0:5000/health")
+    print(f"📋 Protocol: IMAGE + AUDIO → PROCESS → STREAM RESPONSE")
+    print(f"⚡ Stream chunk: {STREAM_CHUNK_SIZE/1024:.0f} KB (Low Latency)")
+    print(f"🎯 Latency: ~1 second to first audio")
     print("=" * 60 + "\n")
     print("Press Ctrl+C to stop the server\n")
     
